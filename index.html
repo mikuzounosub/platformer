@@ -144,4 +144,580 @@
         
         // カラーパレット
         const COL_PLY = '#3498db'; // プレイヤー
-        const COL_GRD = '#2d3436'; // 床（
+        const COL_GRD = '#2d3436'; // 床（メイン）
+        const COL_GRD_T = '#636e72'; // 床（上部）
+        const COL_SPK = '#e74c3c'; // 針
+        const COL_BG = '#161625'; // 背景
+        const COL_FLG_B = '#f1c40f'; // 旗（中間）
+        const COL_FLG_G = '#2ecc71'; // 旗（ゴール）
+        const COL_ENM = '#ff3300'; // 敵
+        
+        const canvas = document.getElementById('gameCanvas');
+        const ctx = canvas.getContext('2d');
+        const uiDeaths = document.getElementById('death-count');
+        
+        // ゲームオブジェクト
+        let player;
+        let platforms = [];
+        let spikes = [];
+        let checkpoints = [];
+        let enemies = [];
+        let goal = null;
+        
+        let camera = { x: 0, y: 0 };
+        let keys = {};
+        let touchControls = { left: false, right: false };
+        let deathCount = 0;
+        let currentSpawnPoint = { x: 50, y: V_HEIGHT - 100 }; // 初期スポーン
+        let worldWidth = 0; // ステージの横幅
+
+        // --- クラス定義 ---
+        
+        class Player {
+            constructor(x, y) {
+                this.x = x; this.y = y;
+                this.width = 24; this.height = 32;
+                this.vx = 0; this.vy = 0;
+                this.onGround = false;
+                this.onWall = false; // 壁に触れているか（左右）
+                this.wallDir = 0;   // -1: 左の壁, 1: 右の壁
+                this.canDoubleJump = false;
+                this.isDead = false;
+            }
+
+            update() {
+                if (this.isDead) return;
+
+                // 左右移動
+                let moveDir = 0;
+                if (keys['ArrowLeft'] || keys['a'] || touchControls.left) moveDir = -1;
+                if (keys['ArrowRight'] || keys['d'] || touchControls.right) moveDir = 1;
+                this.vx = moveDir * MOVE_SPEED;
+
+                // 重力
+                this.vy += GRAVITY;
+                if (this.vy > TERMINAL_VELOCITY) this.vy = TERMINAL_VELOCITY;
+
+                // 壁ずり落ち（壁に触れていて落下中）
+                if (this.onWall && this.vy > 2) {
+                    this.vy = 2; // 落下速度を緩和
+                }
+
+                // 位置更新（仮）
+                this.x += this.vx;
+                this.y += this.vy;
+
+                // ステージの左端ループ防止
+                if (this.x < 0) this.x = 0;
+            }
+
+            jump() {
+                if (this.isDead) return;
+                
+                if (this.onGround) {
+                    this.vy = JUMP_FORCE;
+                    this.onGround = false;
+                    this.canDoubleJump = true;
+                    this.onWall = false;
+                } 
+                else if (this.onWall) {
+                    // 壁キック: 反対方向に飛ぶ
+                    this.vx = -this.wallDir * WALL_KICK_VX;
+                    this.vy = WALL_KICK_VY;
+                    this.onWall = false;
+                    this.canDoubleJump = true; // 壁キック後は2段ジャンプ可
+                }
+                else if (this.canDoubleJump) {
+                    // 2段ジャンプ
+                    this.vy = JUMP_FORCE * 0.8; // 少し弱く
+                    this.canDoubleJump = false;
+                }
+            }
+
+            draw(ctx, camX, camY) {
+                if (this.isDead) return;
+                ctx.save();
+                
+                // プレイヤー本体
+                ctx.fillStyle = COL_PLY;
+                ctx.fillRect(this.x - camX, this.y - camY, this.width, this.height);
+                
+                // 目（移動方向を見る）
+                ctx.fillStyle = '#fff';
+                let eyeX = (this.vx >= 0) ? 14 : 4;
+                ctx.fillRect(this.x - camX + eyeX, this.y - camY + 8, 6, 6);
+                
+                // 残りジャンプ回数のインジケーター
+                if (this.canDoubleJump && !this.onGround && !this.onWall) {
+                    ctx.fillStyle = '#fff';
+                    ctx.beginPath();
+                    ctx.arc(this.x - camX + this.width/2, this.y - camY - 10, 4, 0, Math.PI*2);
+                    ctx.fill();
+                }
+
+                ctx.restore();
+            }
+        }
+
+        class Platform {
+            constructor(x, y, w, h) {
+                this.x = x; this.y = y; this.width = w; this.height = h;
+            }
+            draw(ctx, camX, camY) {
+                // カメラ外なら描画しない
+                if (this.x + this.width < camX || this.x > camX + V_WIDTH) return;
+                
+                ctx.fillStyle = COL_GRD;
+                ctx.fillRect(this.x - camX, this.y - camY, this.width, this.height);
+                // 上部ライン
+                ctx.fillStyle = COL_GRD_T;
+                ctx.fillRect(this.x - camX, this.y - camY, this.width, 4);
+            }
+        }
+
+        class Spike {
+            constructor(x, y, count, dir = 'up') { // dir: up, down, left, right
+                this.x = x; this.y = y; this.count = count; this.dir = dir;
+                this.size = 20; // 1個のサイズ
+                // 判定用矩形
+                this.width = (dir === 'up' || dir === 'down') ? this.size * count : this.size;
+                this.height = (dir === 'left' || dir === 'right') ? this.size * count : this.size;
+            }
+            draw(ctx, camX, camY) {
+                if (this.x + this.width < camX || this.x > camX + V_WIDTH) return;
+                ctx.fillStyle = COL_SPK;
+                ctx.beginPath();
+                
+                for (let i = 0; i < this.count; i++) {
+                    let px, py;
+                    if (this.dir === 'up') {
+                        px = this.x + (i * this.size); py = this.y + this.size;
+                        ctx.moveTo(px - camX, py - camY); // 左下
+                        ctx.lineTo(px + this.size/2 - camX, this.y - camY); // 頂点
+                        ctx.lineTo(px + this.size - camX, py - camY); // 右下
+                    } else if (this.dir === 'down') {
+                        px = this.x + (i * this.size); py = this.y;
+                        ctx.moveTo(px - camX, py - camY); // 左上
+                        ctx.lineTo(px + this.size/2 - camX, this.y + this.size - camY); // 頂点
+                        ctx.lineTo(px + this.size - camX, py - camY); // 右上
+                    } else if (this.dir === 'left') {
+                        px = this.x + this.size; py = this.y + (i * this.size);
+                        ctx.moveTo(px - camX, py - camY); // 右上
+                        ctx.lineTo(this.x - camX, py + this.size/2 - camY); // 頂点
+                        ctx.lineTo(px - camX, py + this.size - camY); // 右下
+                    } else if (this.dir === 'right') {
+                        px = this.x; py = this.y + (i * this.size);
+                        ctx.moveTo(px - camX, py - camY); // 左上
+                        ctx.lineTo(this.x + this.size - camX, py + this.size/2 - camY); // 頂点
+                        ctx.lineTo(px - camX, py + this.size - camY); // 左下
+                    }
+                }
+                ctx.fill();
+            }
+        }
+
+        class Flag {
+            constructor(x, y, isGoal = false) {
+                this.x = x; this.y = y; this.width = 30; this.height = 60;
+                this.isGoal = isGoal;
+                this.active = false;
+            }
+            draw(ctx, camX, camY) {
+                let color = this.isGoal ? COL_FLG_G : (this.active ? '#fff' : COL_FLG_B);
+                let sizeMult = this.isGoal ? 1.5 : 1;
+                
+                ctx.fillStyle = '#8e44ad'; // ポール
+                ctx.fillRect(this.x - camX + 10, this.y - camY + (this.height*(1-sizeMult)), 5, this.height*sizeMult);
+                
+                ctx.fillStyle = color;
+                ctx.beginPath();
+                ctx.moveTo(this.x - camX + 15, this.y - camY + (this.height*(1-sizeMult)));
+                ctx.lineTo(this.x - camX + 15 + (20*sizeMult), this.y - camY + 15 + (this.height*(1-sizeMult)));
+                ctx.lineTo(this.x - camX + 15, this.y - camY + 30 + (this.height*(1-sizeMult)));
+                ctx.fill();
+            }
+        }
+
+        class Enemy {
+            constructor(x, y) {
+                this.x = x; this.y = y; this.width = 30; this.height = 30;
+                this.startX = x;
+                this.vx = 0; this.vy = 0;
+                this.speed = 2.5;
+                this.state = 'idle'; // idle, chase
+                this.chaseRange = 300;
+            }
+            update(player) {
+                let dist = Math.abs(player.x - this.x);
+                
+                if (this.state === 'idle' && dist < this.chaseRange && Math.abs(player.y - this.y) < 100) {
+                    this.state = 'chase';
+                }
+
+                if (this.state === 'chase') {
+                    this.vx = (player.x > this.x) ? this.speed : -this.speed;
+                } else {
+                    this.vx = 0;
+                }
+
+                this.vy += GRAVITY;
+                this.x += this.vx;
+                this.y += this.vy;
+                
+                // 簡易プラットフォーム衝突判定（敵用）
+                enemiesOnGroundCollision(this);
+            }
+            draw(ctx, camX, camY) {
+                if (this.x + this.width < camX || this.x > camX + V_WIDTH) return;
+                ctx.fillStyle = COL_ENM;
+                ctx.fillRect(this.x - camX, this.y - camY, this.width, this.height);
+                // 目（怒り）
+                ctx.fillStyle = '#000';
+                ctx.fillRect(this.x - camX + 5, this.y - camY + 8, 6, 6);
+                ctx.fillRect(this.x - camX + 19, this.y - camY + 8, 6, 6);
+                ctx.fillStyle = '#fff'; // 瞳孔
+                ctx.fillRect(this.x - camX + (this.vx > 0 ? 8 : 6), this.y - camY + 10, 2, 2);
+                ctx.fillRect(this.x - camX + (this.vx > 0 ? 22 : 20), this.y - camY + 10, 2, 2);
+            }
+        }
+
+        // --- ステージ生成 (ハードモード) ---
+        function createLevel() {
+            platforms = []; spikes = []; checkpoints = []; enemies = [];
+            
+            // 1. スタート地点
+            platforms.push(new Platform(0, V_HEIGHT - 40, 200, 40));
+            
+            // 2. 最初の針の谷（2段ジャンプ必須）
+            platforms.push(new Platform(300, V_HEIGHT - 40, 100, 40));
+            spikes.push(new Spike(200, V_HEIGHT - 20, 5, 'up')); // 底の針
+
+            // 3. 壁キック地帯1（登る）
+            platforms.push(new Platform(450, V_HEIGHT - 150, 20, 150)); // 壁
+            platforms.push(new Platform(530, V_HEIGHT - 250, 20, 150)); // 壁
+            platforms.push(new Platform(450, V_HEIGHT - 350, 20, 100)); // 壁
+            platforms.push(new Platform(400, V_HEIGHT - 350, 50, 10));  // 足場
+            
+            // ★難しいポイント: 壁キック中に針を避ける
+            spikes.push(new Spike(470, V_HEIGHT - 150, 3, 'left')); // 右側の壁に針
+
+            // 4. チェックポイント1
+            platforms.push(new Platform(600, V_HEIGHT - 100, 150, 10));
+            checkpoints.push(new Flag(620, V_HEIGHT - 160));
+            
+            // 5. 狭い足場渡り＆天井の針
+            platforms.push(new Platform(800, V_HEIGHT - 100, 30, 10));
+            platforms.push(new Platform(900, V_HEIGHT - 100, 30, 10));
+            platforms.push(new Platform(1000, V_HEIGHT - 100, 30, 10));
+            platforms.push(new Platform(800, 0, 250, 100)); // 天井
+            spikes.push(new Spike(820, 100, 9, 'down')); // 天井の針（ジャンプしすぎると死ぬ）
+
+            // 6. 壁キック地帯2 (横移動)
+            platforms.push(new Platform(1150, V_HEIGHT - 250, 20, 250)); // 巨大な壁
+            platforms.push(new Platform(1250, V_HEIGHT - 450, 20, 350)); // 巨大な壁2
+            // ★難しいポイント: ギリギリの壁キックを要求
+            spikes.push(new Spike(1170, V_HEIGHT - 150, 12, 'up')); // 下は針の海
+
+            // 7. チェックポイント2
+            platforms.push(new Platform(1400, V_HEIGHT - 40, 200, 40));
+            checkpoints.push(new Flag(1420, V_HEIGHT - 100));
+
+            // 8. 敵地帯 (ここから動く敵)
+            platforms.push(new Platform(1700, V_HEIGHT - 40, 400, 40));
+            enemies.push(new Enemy(2050, V_HEIGHT - 70));
+            
+            // ★難しいポイント: 敵をジャンプで避けた先に針
+            spikes.push(new Spike(1850, V_HEIGHT - 60, 2, 'up')); 
+
+            platforms.push(new Platform(2150, V_HEIGHT - 120, 50, 10)); // 空中足場
+            
+            // 9. 最後の壁キック＆針
+            platforms.push(new Platform(2300, V_HEIGHT - 350, 20, 350));
+            spikes.push(new Spike(2280, V_HEIGHT - 250, 5, 'right')); // 左側に針
+
+            platforms.push(new Platform(2400, V_HEIGHT - 450, 20, 350));
+            spikes.push(new Spike(2320, V_HEIGHT - 400, 8, 'left')); // 右側に針（狭い！）
+
+            // 10. ゴール
+            platforms.push(new Platform(2600, V_HEIGHT - 40, 200, 40));
+            goal = new Flag(2700, V_HEIGHT - 100, true);
+            
+            worldWidth = 2900;
+        }
+
+        // --- コア機能 (衝突判定、描画、ループ) ---
+
+        // 衝突判定 (矩形 vs 矩形)
+        function rectIntersect(r1, r2) {
+            return !(r2.x >= r1.x + r1.width || 
+                     r2.x + r2.width <= r1.x || 
+                     r2.y >= r1.y + r1.height || 
+                     r2.y + r2.height <= r1.y);
+        }
+
+        // 衝突判定 (プレイヤー vs プラットフォーム)
+        function playerPlatformsCollision() {
+            player.onGround = false;
+            player.onWall = false;
+            player.wallDir = 0;
+
+            for (let plat of platforms) {
+                // カメラ外のプラットフォームは計算しない（最適化）
+                if (plat.x + plat.width < camera.x - 100 || plat.x > camera.x + V_WIDTH + 100) continue;
+
+                if (rectIntersect(player, plat)) {
+                    // 以前の位置を取得して、どの方向から衝突したか判定
+                    let oldX = player.x - player.vx;
+                    let oldY = player.y - player.vy;
+
+                    // Y軸方向の衝突（床・天井）
+                    if (oldY + player.height <= plat.y) { // 上から（床）
+                        player.y = plat.y - player.height;
+                        player.vy = 0;
+                        player.onGround = true;
+                        player.canDoubleJump = true; // 接地で2段ジャンプ回復
+                    } else if (oldY >= plat.y + plat.height) { // 下から（天井）
+                        player.y = plat.y + plat.height;
+                        player.vy = GRAVITY; // 跳ね返る
+                    }
+
+                    // X軸方向の衝突（壁）
+                    // Y軸の判定を再度行う必要がある（足が少し入っている場合など）
+                    if (rectIntersect(player, plat)) {
+                        if (oldX + player.width <= plat.x) { // 左から（右の壁）
+                            player.x = plat.x - player.width;
+                            player.vx = 0;
+                            player.onWall = true;
+                            player.wallDir = 1; // 右に壁
+                        } else if (oldX >= plat.x + plat.width) { // 右から（左の壁）
+                            player.x = plat.x + plat.width;
+                            player.vx = 0;
+                            player.onWall = true;
+                            player.wallDir = -1; // 左に壁
+                        }
+                    }
+                }
+            }
+        }
+
+        // 敵用の衝突判定（足場）
+        function enemiesOnGroundCollision(enemy) {
+            enemy.onGround = false;
+            for (let plat of platforms) {
+                if (rectIntersect(enemy, plat)) {
+                    // 上からのみ衝突判定
+                    let oldY = enemy.y - enemy.vy;
+                    if (oldY + enemy.height <= plat.y) {
+                        enemy.y = plat.y - enemy.height;
+                        enemy.vy = 0;
+                        enemy.onGround = true;
+                    }
+                }
+            }
+        }
+
+        function playerSpikesCollision() {
+            // スパイクは少し判定を小さくして、見た目通りにする
+            let shrink = 4;
+            let hitBox = { x: player.x + shrink, y: player.y + shrink, width: player.width - shrink*2, height: player.height - shrink*2 };
+            
+            for (let spike of spikes) {
+                // カメラ外は判定しない
+                if (spike.x + spike.width < camera.x || spike.x > camera.x + V_WIDTH) continue;
+
+                if (rectIntersect(hitBox, spike)) {
+                    killPlayer();
+                    break;
+                }
+            }
+        }
+
+        function playerObjectsCollision() {
+            // チェックポイント
+            for (let cp of checkpoints) {
+                if (!cp.active && rectIntersect(player, cp)) {
+                    // 他のチェックポイントを非アクティブに
+                    checkpoints.forEach(c => c.active = false);
+                    cp.active = true;
+                    currentSpawnPoint = { x: cp.x + cp.width/2 - player.width/2, y: cp.y + cp.height - player.height };
+                    // プチエフェクト（描画で対応）
+                }
+            }
+            // 敵
+            for (let enemy of enemies) {
+                if (rectIntersect(player, enemy)) {
+                    killPlayer();
+                }
+            }
+            // ゴール
+            if (rectIntersect(player, goal)) {
+                gameClear();
+            }
+        }
+
+        function killPlayer() {
+            player.isDead = true;
+            deathCount++;
+            uiDeaths.innerText = deathCount;
+            
+            // プチ爆発エフェクトの代わりに少し待ってリスタート
+            setTimeout(() => {
+                player = new Player(currentSpawnPoint.x, currentSpawnPoint.y);
+                camera.x = player.x - V_WIDTH / 3; // カメラも少し戻す
+            }, 500);
+        }
+
+        // カメラ更新 (滑らかに追従)
+        function updateCamera() {
+            let targetX = player.x - V_WIDTH / 3; // プレイヤーを画面の1/3位置に置く
+            
+            // 画面端の制限
+            if (targetX < 0) targetX = 0;
+            if (targetX > worldWidth - V_WIDTH) targetX = worldWidth - V_WIDTH;
+            
+            camera.x += (targetX - camera.x) * 0.1; // 補間
+        }
+
+        function gameLoop() {
+            if (currentGameState !== GameState.PLAYING) return;
+            
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+            
+            // 1. 物理・更新
+            player.update();
+            
+            // 2. 衝突判定 (物理演算の後に位置を補正)
+            playerPlatformsCollision();
+            playerSpikesCollision();
+            playerObjectsCollision();
+            
+            // 落下死
+            if (player.y > V_HEIGHT + 100) {
+                killPlayer();
+            }
+
+            // 敵の更新
+            enemies.forEach(e => e.update(player));
+
+            // 3. カメラ
+            updateCamera();
+            
+            // 4. 描画 (仮想解像度を実際のCanvasサイズにスケーリング)
+            ctx.save();
+            const scale = canvas.width / V_WIDTH;
+            ctx.scale(scale, scale);
+            
+            // 背景（パララックスっぽく、少し動かす）
+            ctx.fillStyle = COL_BG;
+            ctx.fillRect(0, 0, V_WIDTH, V_HEIGHT);
+            // 遠景の山（適当）
+            ctx.fillStyle = '#111';
+            ctx.beginPath(); ctx.moveTo(0, V_HEIGHT); ctx.lineTo(camera.x*-0.1 + 100, 200); ctx.lineTo(camera.x*-0.1 + 300, V_HEIGHT); ctx.fill();
+            ctx.beginPath(); ctx.moveTo(0, V_HEIGHT); ctx.lineTo(camera.x*-0.1 + 400, 150); ctx.lineTo(camera.x*-0.1 + 700, V_HEIGHT); ctx.fill();
+
+            // オブジェクト
+            platforms.forEach(p => p.draw(ctx, camera.x, 0));
+            spikes.forEach(s => s.draw(ctx, camera.x, 0));
+            checkpoints.forEach(c => c.draw(ctx, camera.x, 0));
+            enemies.forEach(e => e.draw(ctx, camera.x, 0));
+            goal.draw(ctx, camera.x, 0);
+            player.draw(ctx, camera.x, 0);
+            
+            ctx.restore();
+            
+            requestAnimationFrame(gameLoop);
+        }
+
+        // --- 画面サイズ・UI・初期化 ---
+        
+        const gameContainer = document.getElementById('game-container');
+        const msgScreen = document.getElementById('msg-screen');
+        const msgTitle = document.getElementById('msg-title');
+        const msgBody = document.getElementById('msg-body');
+        const startBtn = document.getElementById('start-btn');
+        const controller = document.getElementById('controller');
+
+        function resizeCanvas() {
+            const windowWidth = window.innerWidth;
+            const windowHeight = window.innerHeight;
+            
+            let newWidth = windowWidth;
+            let newHeight = windowWidth * (V_HEIGHT / V_WIDTH);
+            
+            if (newHeight > windowHeight) {
+                newHeight = windowHeight;
+                newWidth = windowHeight * (V_WIDTH / V_HEIGHT);
+            }
+            
+            canvas.width = windowWidth * 1.5; // 高解像度対応
+            canvas.height = (windowWidth * 1.5) * (V_HEIGHT / V_WIDTH);
+
+            if (newHeight > windowHeight) {
+                canvas.height = windowHeight * 1.5;
+                canvas.width = (windowHeight * 1.5) * (V_WIDTH / V_HEIGHT);
+            }
+
+            canvas.style.width = `${newWidth}px`;
+            canvas.style.height = `${newHeight}px`;
+            
+            gameContainer.style.width = `${newWidth}px`;
+            gameContainer.style.height = `${newHeight}px`;
+            
+            // コントローラーの位置調整
+            if ('ontouchstart' in window) {
+                controller.style.display = 'flex';
+                // 画面が横長のときは、ボタンを端に寄せるなどの調整をここに
+            }
+        }
+
+        window.addEventListener('resize', resizeCanvas);
+        window.addEventListener('orientationchange', resizeCanvas);
+
+        // キーボード入力
+        window.addEventListener('keydown', e => { keys[e.key] = true; if(e.key === 'ArrowUp' || e.key === 'w' || e.key === ' ') player.jump(); });
+        window.addEventListener('keyup', e => { keys[e.key] = false; });
+
+        // スマホタッチ操作
+        function setupTouchControls() {
+            const bLeft = document.getElementById('btn-left');
+            const bRight = document.getElementById('btn-right');
+            const bJump = document.getElementById('btn-jump');
+
+            bLeft.addEventListener('touchstart', (e) => { e.preventDefault(); touchControls.left = true; });
+            bLeft.addEventListener('touchend', (e) => { e.preventDefault(); touchControls.left = false; });
+            
+            bRight.addEventListener('touchstart', (e) => { e.preventDefault(); touchControls.right = true; });
+            bRight.addEventListener('touchend', (e) => { e.preventDefault(); touchControls.right = false; });
+
+            bJump.addEventListener('touchstart', (e) => { e.preventDefault(); player.jump(); });
+        }
+
+        function startGame() {
+            deathCount = 0;
+            uiDeaths.innerText = "0";
+            currentSpawnPoint = { x: 50, y: V_HEIGHT - 100 };
+            player = new Player(currentSpawnPoint.x, currentSpawnPoint.y);
+            camera.x = 0; camera.y = 0;
+            createLevel();
+            msgScreen.style.display = 'none';
+            currentGameState = GameState.PLAYING;
+            gameLoop();
+        }
+
+        function gameClear() {
+            currentGameState = GameState.CLEAR;
+            msgScreen.style.display = 'flex';
+            msgTitle.innerText = "🎉 GAME CLEAR !!";
+            msgTitle.style.color = COL_FLG_G;
+            msgBody.innerHTML = `見事に火山島から脱出した！<br>☠ DEATHS: ${deathCount}`;
+            startBtn.innerText = "もう一度挑戦";
+        }
+
+        // 初期実行
+        resizeCanvas();
+        setupTouchControls();
+        createLevel(); // 描画テスト用
+        msgScreen.style.display = 'flex'; // スタート画面を表示
+    </script>
+</body>
+</html>
