@@ -1,0 +1,147 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+    <title>🌋 火山島からの脱出 (ハード・プラットフォーマー)</title>
+    <style>
+        * { box-sizing: border-box; }
+        body {
+            background-color: #1a1a2e;
+            color: #fff;
+            font-family: 'Courier New', Courier, monospace; /* レトロ感 */
+            margin: 0;
+            padding: 0;
+            overflow: hidden;
+            width: 100vw;
+            height: 100vh;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            touch-action: manipulation;
+            user-select: none;
+            -webkit-user-select: none;
+        }
+        #game-container {
+            position: relative;
+            background: linear-gradient(to bottom, #2d3436, #161625);
+            box-shadow: 0 0 30px rgba(0,0,0,0.8);
+            border: 2px solid #444;
+            overflow: hidden; /* カメラ外を隠す */
+        }
+        canvas {
+            display: block;
+            background: transparent;
+        }
+        /* UI */
+        #ui-layer {
+            position: absolute;
+            top: 10px;
+            left: 10px;
+            pointer-events: none;
+            z-index: 10;
+            font-size: 14px;
+            text-shadow: 1px 1px 2px #000;
+        }
+        #msg-screen {
+            display: none;
+            position: absolute;
+            top: 0; left: 0; width: 100%; height: 100%;
+            background: rgba(0,0,0,0.85);
+            z-index: 20;
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+            align-items: center;
+            text-align: center;
+            padding: 20px;
+        }
+        #msg-screen h2 { font-size: 32px; margin-top: 0; }
+        #msg-screen p { font-size: 16px; color: #ccc; }
+        button {
+            background: #e74c3c;
+            border: none;
+            color: white;
+            padding: 12px 24px;
+            font-size: 18px;
+            border-radius: 6px;
+            cursor: pointer;
+            margin-top: 20px;
+            font-weight: bold;
+        }
+        button:hover { background: #c0392b; }
+        /* コントローラー (スマホ用・全画面対応のためJSで位置調整) */
+        #controller {
+            position: absolute;
+            bottom: 30px;
+            left: 50%;
+            transform: translateX(-50%);
+            width: 90%;
+            max-width: 400px;
+            display: flex;
+            justify-content: space-between;
+            z-index: 15;
+            display: none; /* デフォルト非表示、タッチで表示 */
+        }
+        .btn-group { display: flex; gap: 15px; }
+        .btn {
+            background: rgba(80, 80, 80, 0.6);
+            border: 2px solid #888;
+            color: white;
+            width: 60px; height: 60px;
+            border-radius: 12px;
+            display: flex; justify-content: center; align-items: center;
+            font-size: 28px; font-weight: bold;
+            touch-action: none;
+        }
+        .btn:active { background: rgba(120, 120, 120, 0.8); }
+        #btn-jump {
+            background: rgba(52, 152, 219, 0.6);
+            border-color: #2980b9;
+        }
+        #btn-jump:active { background: rgba(41, 128, 185, 0.8); }
+    </style>
+</head>
+<body>
+
+    <div id="game-container">
+        <div id="ui-layer">
+            <div>☠ DEATHS: <span id="death-count">0</span></div>
+        </div>
+
+        <div id="msg-screen">
+            <h2 id="msg-title">HARD PLATFORMER</h2>
+            <p id="msg-body">操作: ← → 移動 / ↑ ジャンプ (2段可) / 壁キック</p>
+            <button id="start-btn" onclick="startGame()">START</button>
+        </div>
+
+        <canvas id="gameCanvas"></canvas>
+
+        <div id="controller">
+            <div class="btn-group">
+                <div class="btn" id="btn-left">←</div>
+                <div class="btn" id="btn-right">→</div>
+            </div>
+            <div class="btn" id="btn-jump">↑</div>
+        </div>
+    </div>
+
+    <script>
+        // --- 定数・設定 ---
+        const GameState = { START: 0, PLAYING: 1, CLEAR: 2 };
+        let currentGameState = GameState.START;
+        
+        // 仮想解像度（ステージ設計の基準値）
+        const V_WIDTH = 800; 
+        const V_HEIGHT = 450;
+        
+        const GRAVITY = 0.8;
+        const MOVE_SPEED = 5;
+        const JUMP_FORCE = -15;
+        const WALL_KICK_VX = 8;  // 壁キックの横跳び力
+        const WALL_KICK_VY = -12; // 壁キックの縦跳び力
+        const TERMINAL_VELOCITY = 15; // 落下速度制限
+        
+        // カラーパレット
+        const COL_PLY = '#3498db'; // プレイヤー
+        const COL_GRD = '#2d3436'; // 床（
